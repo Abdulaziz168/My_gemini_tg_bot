@@ -87,3 +87,21 @@ async def analyze_image(
     except Exception as e:
         logger.error(f"Gemini vision xatolik: {e}")
         raise RuntimeError(f"Rasm tahlili muvaffaqiyatsiz: {e}")
+
+
+async def extract_text_from_image(
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+) -> str:
+    """
+    Rasmdagi barcha matnni OCR qilib ko'chiradi.
+
+    Hech narsa topilmasa — xabar qaytaradi.
+    """
+    ocr_prompt = """Bu rasmda yozilgan BARCHA matnni aynan ko'chir.
+- Formatlashni saqlashga harakat qil (jadval, ro'yxat, paragraf)
+- Hech qanday izoh, tahlil yoki qo'shimcha yozma
+- Faqat rasmdagi matnni yoz
+- Agar hech qanday matn yo'q bo'lsa: "Rasimda matn topilmadi" deb yoz"""
+
+    return await analyze_image(image_bytes, ocr_prompt, mime_type)

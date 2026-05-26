@@ -67,6 +67,7 @@ def translate_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🇺🇿 O'zbek",  callback_data="translate:uz"),
             InlineKeyboardButton(text="🇷🇺 Рус",    callback_data="translate:ru"),
             InlineKeyboardButton(text="🇬🇧 Eng",    callback_data="translate:en"),
+            
         ],
         [
             InlineKeyboardButton(text="🇹🇷 Türk",   callback_data="translate:tr"),
@@ -80,6 +81,8 @@ def translate_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="🤖 AI Chat", callback_data="switch:chat"),
             InlineKeyboardButton(text="❌ Bekor",   callback_data="translate:cancel"),
+            InlineKeyboardButton(text="📋 Xulosa", callback_data="summarize"),
+            InlineKeyboardButton(text="🔊 Ovozli", callback_data="tts")
         ],
     ])
 
@@ -95,7 +98,8 @@ def chat_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📜 Tarixni ko'rish",  callback_data="chat:history"),
         ],
         [
-            InlineKeyboardButton(text="🚪 Chatdan chiqish", callback_data="chat:exit"),
+            InlineKeyboardButton(text="� Ovozli", callback_data="tts"),
+            InlineKeyboardButton(text="�🚪 Chatdan chiqish", callback_data="chat:exit"),
         ],
     ])
 

@@ -113,6 +113,23 @@ Text:
     return await _call_gemini(prompt)
 
 
+async def summarize_text(text: str, target_lang: str = "uz") -> str:
+    """
+    Berilgan matnni qisqa xulosa qilib beradi.
+    target_lang: 'uz', 'ru', 'en'
+    """
+    lang_names = {"uz": "o'zbek", "ru": "русском", "en": "English"}
+    lang_name = lang_names.get(target_lang, "o'zbek")
+
+    prompt = f"""Quyidagi matnni {lang_name} tilida 3-5 qisqa gapda xulosa qil.
+Faqat xulosani yoz, boshqa hech narsa yozma.
+
+Matn:
+{text}"""
+
+    return await _call_gemini(prompt)
+
+
 async def detect_language(text: str) -> str:
     """Matn tilini aniqlaydi."""
     prompt = f"""Detect the language of this text and respond with ONLY the language name in English (e.g. "Russian", "Uzbek", "English").

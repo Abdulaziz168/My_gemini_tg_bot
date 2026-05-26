@@ -2,7 +2,11 @@ import asyncio
 import io
 import logging
 import os
+import html
+from services.tts import text_to_speech
+from aiogram.types import FSInputFile
 
+import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -12,6 +16,7 @@ from aiogram.types import CallbackQuery, Message
 
 from config import config
 from database.db import (
+    DB,
     add_chat_message,
     ban_user,
     clear_chat_history,
@@ -22,14 +27,16 @@ from database.db import (
     get_global_stats,
     get_user,
     get_user_full_stats,
+    get_ui_lang,
     init_db,
     log_request,
     set_lang_pref,
 )
 from middlewares.auth import AuthMiddleware
-from services.chat import analyze_image, chat_with_gemini
+from services.chat import analyze_image, chat_with_gemini, extract_text_from_image
 from services.stt import transcribe_audio
-from services.translator import refine_and_format_text, translate_stt_result, translate_text
+from services.translator import refine_and_format_text, summarize_text, translate_stt_result, translate_text
+from utils.i18n import t
 from utils.keyboards import (
     LANG_LABELS,
     TRANSLATE_TARGET_LABELS,
@@ -53,6 +60,11 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
+async def get_user_ui_lang(user_id: int) -> str:
+    async with aiosqlite.connect(DB) as db:
+        return await get_ui_lang(db, user_id)
+
+
 # ══════════════════════════════════════════════════════════════
 #  FSM STATES
 # ══════════════════════════════════════════════════════════════
@@ -61,7 +73,17 @@ class ChatState(StatesGroup):
     active = State()          # AI Chat rejimi
 
 class TranslateState(StatesGroup):
+    waiting_text = State()    # Tarjima uchun matnni kutish
     waiting_lang = State()    # Matn tarjimasi: tilni kutish
+
+class PhotoState(StatesGroup):
+    waiting_for_prompt = State()  # Rasm caption/prompt kutish (forward uchun)
+
+class OCRState(StatesGroup):
+    waiting_image = State()
+
+class SummarizeState(StatesGroup):
+    waiting_text = State()
 
 class BroadcastState(StatesGroup):
     waiting_message = State() # Admin broadcast
@@ -86,14 +108,19 @@ async def _process_audio(message: Message, file_id: str, ext: str, bot: Bot):
     """STT + ixtiyoriy tarjima yoki AI Redaktor."""
     user = message.from_user
     db_user = await get_user(user.id)
+    ui_lang = db_user.get("ui_lang", "uz") if db_user else "uz"
     lang_pref = db_user.get("lang_pref", "auto") if db_user else "auto"
     daily_count = await get_daily_count(user.id)
     remaining = config.DAILY_LIMIT - daily_count
 
     status = await message.reply(
-        f"⏳ <b>Tahlil qilinmoqda...</b>\n"
-        f"🌐 Rejim: <code>{LANG_LABELS.get(lang_pref, lang_pref)}</code>\n"
-        f"📊 Bugungi qolgan: <b>{remaining}</b>/{config.DAILY_LIMIT}",
+        t(
+            ui_lang,
+            "audio_processing",
+            mode=LANG_LABELS.get(lang_pref, lang_pref),
+            remaining=remaining,
+            daily_limit=config.DAILY_LIMIT,
+        ),
         parse_mode="HTML",
     )
 
@@ -104,8 +131,12 @@ async def _process_audio(message: Message, file_id: str, ext: str, bot: Bot):
         size_mb = os.path.getsize(local_path) / (1024 * 1024)
         if size_mb > config.MAX_AUDIO_SIZE_MB:
             await status.edit_text(
-                f"❌ Fayl hajmi juda katta ({size_mb:.1f} MB).\n"
-                f"Maksimal: {config.MAX_AUDIO_SIZE_MB} MB"
+                t(
+                    ui_lang,
+                    "too_large_audio",
+                    size=size_mb,
+                    max_mb=config.MAX_AUDIO_SIZE_MB,
+                )
             )
             return
 
@@ -120,8 +151,7 @@ async def _process_audio(message: Message, file_id: str, ext: str, bot: Bot):
         if not text:
             await log_request(user.id, elapsed, 0, success=False)
             await status.edit_text(
-                "⚠️ <b>Hech narsa aniqlanmadi.</b>\n"
-                "Audio shovqinli yoki juda qisqa bo'lishi mumkin.",
+                t(ui_lang, "audio_no_text"),
                 parse_mode="HTML",
             )
             return
@@ -131,13 +161,12 @@ async def _process_audio(message: Message, file_id: str, ext: str, bot: Bot):
 
         if lang_pref.startswith("translate_"):
             target = lang_pref.split("_", 1)[1]
+            flag = TRANSLATE_TARGET_LABELS.get(target, target)
             await status.edit_text(
-                f"🔄 <b>Tarjima qilinmoqda...</b>\n"
-                f"🎯 Maqsad: {TRANSLATE_TARGET_LABELS.get(target, target)}",
+                t(ui_lang, "translate_processing", target=flag),
                 parse_mode="HTML",
             )
             translated = await translate_stt_result(text, target)
-            flag = TRANSLATE_TARGET_LABELS.get(target, target)
             processed_block = (
                 f"\n\n🌐 <b>Tarjima ({flag}):</b>\n"
                 f"{'─'*30}\n"
@@ -146,13 +175,12 @@ async def _process_audio(message: Message, file_id: str, ext: str, bot: Bot):
 
         elif lang_pref.startswith("redact_"):
             target = lang_pref.split("_", 1)[1]
+            flag = TRANSLATE_TARGET_LABELS.get(target, target)
             await status.edit_text(
-                f"✨ <b>AI Redaktor ishlamoqda...</b>\n"
-                f"🎯 Matn rasmiylashtirilmoqda ({TRANSLATE_TARGET_LABELS.get(target, target)})",
+                t(ui_lang, "redact_processing", target=flag),
                 parse_mode="HTML",
             )
             refined = await refine_and_format_text(text, target)
-            flag = TRANSLATE_TARGET_LABELS.get(target, target)
             processed_block = (
                 f"\n\n✨ <b>AI Redaktor ({flag}):</b>\n"
                 f"{'─'*30}\n"
@@ -162,15 +190,13 @@ async def _process_audio(message: Message, file_id: str, ext: str, bot: Bot):
         # ── Natija ──────────────────────────────────────────
         await log_request(user.id, elapsed, len(text), success=True)
 
-        header = (
-            f"📝 <b>Transkripsiya (Xom matn)</b>\n"
-            f"⏱ <i>{elapsed:.1f}s</i>  |  🔤 <i>{len(text)} belgi</i>\n"
-            f"{'─'*30}\n\n"
-        )
+        header = t(ui_lang, "stt_done", elapsed=elapsed)
 
-        full_msg = header + text + processed_block
+        # Show raw STT in monospace/preformatted block to preserve formatting
+        escaped_text = html.escape(text)
+        full_msg = header + f"<pre>{escaped_text}</pre>" + processed_block
         if len(full_msg) > 4096:
-            full_msg = full_msg[:4040] + "\n\n⚠️ <i>Matn qisqartirildi</i>"
+            full_msg = full_msg[:4040] + "\n\n" + t(ui_lang, "text_truncated")
 
         await status.edit_text(full_msg, parse_mode="HTML")
 
@@ -178,8 +204,7 @@ async def _process_audio(message: Message, file_id: str, ext: str, bot: Bot):
         logger.error(f"Audio xatolik (user={user.id}): {e}")
         await log_request(user.id, 0, 0, success=False)
         await status.edit_text(
-            f"❌ <b>Xatolik yuz berdi:</b>\n<i>{str(e)[:300]}</i>\n\n"
-            f"Iltimos, qayta urinib ko'ring.",
+            t(ui_lang, "audio_error", error=str(e)[:300]),
             parse_mode="HTML",
         )
     finally:
@@ -204,8 +229,8 @@ async def cmd_start(message: Message, state: FSMContext):
         f"• 20+ tilda avtomatik aniqlash\n"
         f"• STT natijasini tarjima qilish\n\n"
         f"<b>📝 Matn imkoniyatlari:</b>\n"
-        f"• Har qanday tildagi matnni tarjima qilish\n"
-        f"• 8+ til yo'nalishi\n\n"
+        f"• Har qanday matn yuboring → AI Chat javob beradi\n"
+        f"• Tarjima uchun: /translate\n\n"
         f"<b>🤖 AI Chat (YANGI):</b>\n"
         f"• Gemini bilan multi-turn suhbat\n"
         f"• Suhbat tarixi saqlanadi\n\n"
@@ -213,6 +238,7 @@ async def cmd_start(message: Message, state: FSMContext):
         f"• Istalgan rasm yuboring → AI tahlil qiladi\n"
         f"• Caption qo'shsangiz — aniqroq javob\n\n"
         f"<b>Buyruqlar:</b>\n"
+        f"/translate — Tarjima rejimi\n"
         f"/chat — AI Chat rejimini boshlash\n"
         f"/lang — STT rejimini sozlash\n"
         f"/history — Chat tarixini ko'rish\n"
@@ -230,19 +256,18 @@ async def cmd_help(message: Message):
         "<b>🎙️ Audio → Matn (STT):</b>\n"
         "Ovozli xabar, audio fayl (.mp3 .ogg .wav .m4a)\n"
         "yoki video xabar yuboring — matn olasiz.\n\n"
-        "<b>📝 Matn → Tarjima:</b>\n"
-        "Har qanday tildagi matn yuboring.\n"
+        "<b>📝 Matn → AI Chat (default):</b>\n"
+        "Har qanday matn yuboring — Gemini AI javob beradi.\n"
+        "Tarix saqlanadi, kontekst tushunadi.\n\n"
+        "<b>🌐 Tarjima (/translate):</b>\n"
+        "/translate buyrug'ini yuboring, so'ng matnni yozing.\n"
         "Bot tilni avtomatik aniqlab, tarjima tilini so'raydi.\n\n"
-        "<b>🤖 AI Chat (/chat):</b>\n"
-        "• Gemini AI bilan erkin suhbat\n"
-        "• Tarix saqlanadi, kontekst tushunadi\n"
-        "• /endchat — chatdan chiqish\n"
         "• /history — so'nggi xabarlarni ko'rish\n"
         "• /clearhistory — tarixni tozalash\n\n"
         "<b>📸 Rasm tahlili:</b>\n"
-        "• Istalgan rasm yuboring\n"
-        "• Caption = maxsus ko'rsatma (ixtiyoriy)\n"
-        "• Masalan: caption = 'Bu nima?' yoki 'Matni o'qi'\n\n"
+        "• Rasm yuboring + caption = darhol tahlil\n"
+        "• Forward qilingan rasm (caption yo'q) → bot prompt so'raydi\n"
+        "• Masalan: 'Bu nima?' yoki 'Matni o'qi'\n\n"
         "<b>🌐 STT + Tarjima rejimi (/lang):</b>\n"
         "• 🔍 Auto — Tilni avtomatik aniqlash\n"
         "• 🇺🇿/🇷🇺/🇬🇧 — Aniq til STT\n"
@@ -282,6 +307,30 @@ async def cb_lang(callback: CallbackQuery):
     )
     await callback.answer(f"✅ {label}")
 
+
+@router.callback_query(F.data == "tts")
+async def cb_tts(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    text = data.get("last_stt_text") or data.get("last_bot_reply", "")
+    
+    if not text:
+        await callback.answer("Matn topilmadi.", show_alert=True)
+        return
+
+    await callback.answer("🔊 Tayyorlanmoqda...")
+    await bot.send_chat_action(callback.message.chat.id, "record_voice")
+
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        ui_lang = await get_ui_lang(db, callback.from_user.id)
+
+    file_path = None
+    try:
+        file_path = await text_to_speech(text, lang=ui_lang)
+        audio = FSInputFile(file_path)
+        await bot.send_voice(callback.message.chat.id, voice=audio)
+    finally:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
 
 @router.message(Command("mystats"))
 async def cmd_mystats(message: Message):
@@ -357,6 +406,7 @@ async def handle_chat_message(message: Message, state: FSMContext):
         # Ikkala xabarni ham tarixga saqlash
         await add_chat_message(user_id, "user", user_text)
         await add_chat_message(user_id, "model", reply_text)
+        await state.update_data(last_bot_reply=reply_text)
 
         if len(reply_text) > 4096:
             reply_text = reply_text[:4040] + "\n\n⚠️ <i>Matn qisqartirildi</i>"
@@ -371,10 +421,6 @@ async def handle_chat_message(message: Message, state: FSMContext):
         )
 
 
-@router.message(ChatState.active, F.photo)
-async def handle_chat_photo(message: Message, bot: Bot, state: FSMContext):
-    """Chat rejimida rasm tahlili."""
-    await _handle_photo_core(message, bot)
 
 
 @router.message(Command("endchat"))
@@ -479,65 +525,195 @@ async def cb_switch_to_chat(callback: CallbackQuery, state: FSMContext):
 #  RASM TAHLILI (yangi)
 # ══════════════════════════════════════════════════════════════
 
-async def _handle_photo_core(message: Message, bot: Bot):
+async def _handle_photo_core(message: Message, bot: Bot, prompt: str | None = None):
     """Rasmni Gemini Vision orqali tahlil qilish — asosiy mantiq."""
-    photo = message.photo[-1]  # Eng yuqori sifatli rasm
-    user_prompt = (
-        message.caption.strip()
-        if message.caption
-        else "Bu rasmni batafsil tahlil qil. Nima ko'rayotganingni aniq tushuntir."
-    )
+    photo = message.photo[-1]
+    caption = (message.caption or "").strip().lower()
 
-    status = await message.reply(
-        "🔍 <i>Rasm tahlil qilinmoqda...</i>",
-        parse_mode="HTML",
-    )
+    if caption in ("ocr", "/ocr", "matn", "text"):
+        await bot.send_chat_action(message.chat.id, "typing")
+        status = await message.reply("📝 <i>Matn aniqlanmoqda...</i>", parse_mode="HTML")
+        try:
+            file = await bot.get_file(photo.file_id)
+            buf = io.BytesIO()
+            await bot.download_file(file.file_path, buf)
+            image_bytes = buf.getvalue()
+            result = await extract_text_from_image(image_bytes)
+            if len(result) > 4096:
+                result = result[:4040] + "\n\n⚠️ <i>Matn qisqartirildi</i>"
+            await status.edit_text(f"📝 <b>Rasmdagi matn:</b>\n\n{result}", parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Photo OCR xatolik (user={message.from_user.id}): {e}")
+            await status.edit_text(f"❌ <b>Xatolik:</b> <i>{str(e)[:200]}</i>", parse_mode="HTML")
+        return
+
+    if prompt is None:
+        prompt = (
+            message.caption.strip()
+            if message.caption
+            else "Bu rasmni batafsil tahlil qil. Nima ko'rayotganingni aniq tushuntir."
+        )
+    status = await message.reply("🔍 <i>Rasm tahlil qilinmoqda...</i>", parse_mode="HTML")
     try:
         file = await bot.get_file(photo.file_id)
         buf = io.BytesIO()
         await bot.download_file(file.file_path, buf)
         image_bytes = buf.getvalue()
-
-        result = await analyze_image(image_bytes, user_prompt)
-
+        result = await analyze_image(image_bytes, prompt)
         if len(result) > 4096:
             result = result[:4040] + "\n\n⚠️ <i>Matn qisqartirildi</i>"
-
-        await status.edit_text(
-            f"🖼 <b>Rasm tahlili:</b>\n\n{result}",
-            parse_mode="HTML",
-        )
+        await status.edit_text(f"🖼 <b>Rasm tahlili:</b>\n\n{result}", parse_mode="HTML")
     except Exception as e:
         logger.error(f"Photo handler xatolik (user={message.from_user.id}): {e}")
-        await status.edit_text(
-            f"❌ <b>Xatolik:</b> <i>{str(e)[:200]}</i>",
-            parse_mode="HTML",
+        await status.edit_text(f"❌ <b>Xatolik:</b> <i>{str(e)[:200]}</i>", parse_mode="HTML")
+
+
+async def _handle_photo_by_file_id(message: Message, bot: Bot, file_id: str, prompt: str):
+    """File ID bo'yicha rasmni Gemini Vision ga yuborish (forward + keyingi prompt uchun)."""
+    status = await message.reply("🔍 <i>Rasm tahlil qilinmoqda...</i>", parse_mode="HTML")
+    try:
+        file = await bot.get_file(file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, buf)
+        image_bytes = buf.getvalue()
+        result = await analyze_image(image_bytes, prompt)
+        if len(result) > 4096:
+            result = result[:4040] + "\n\n⚠️ <i>Matn qisqartirildi</i>"
+        await status.edit_text(f"🖼 <b>Rasm tahlili:</b>\n\n{result}", parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Photo (file_id) xatolik (user={message.from_user.id}): {e}")
+        await status.edit_text(f"❌ <b>Xatolik:</b> <i>{str(e)[:200]}</i>", parse_mode="HTML")
+
+
+# ── Rasm handlerlari ──────────────────────────────────────────
+
+_PHOTO_ASK_TEXT = (
+    "📸 <b>Rasm qabul qilindi!</b>\n\n"
+    "✏️ Bu rasm bilan nima qilishni xohlaysiz? Yozing:\n\n"
+    "<i>Masalan: tarjima qil / nima bor / matnni o'qi / tahlil qil</i>\n\n"
+    "Bekor qilish: /cancel"
+)
+
+
+@router.message(ChatState.active, F.photo)
+async def handle_chat_photo(message: Message, bot: Bot, state: FSMContext):
+    """Chat rejimida rasm: caption bo'lsa darhol, bo'lmasa so'ra."""
+    caption = message.caption.strip() if message.caption else None
+    if caption:
+        await _handle_photo_core(message, bot, caption)
+    else:
+        await state.set_state(PhotoState.waiting_for_prompt)
+        await state.update_data(
+            photo_file_id=message.photo[-1].file_id,
+            from_chat=True,
         )
+        await message.answer(_PHOTO_ASK_TEXT, parse_mode="HTML")
 
 
 @router.message(F.photo)
 async def handle_photo(message: Message, bot: Bot, state: FSMContext):
-    """Chat rejimidan tashqarida ham rasm tahlili ishlaydi."""
-    await _handle_photo_core(message, bot)
+    """Oddiy rasm: caption bo'lsa darhol, bo'lmasa (forward) prompt so'ra."""
+    caption = message.caption.strip() if message.caption else None
+    if caption:
+        await _handle_photo_core(message, bot, caption)
+    else:
+        await state.set_state(PhotoState.waiting_for_prompt)
+        await state.update_data(
+            photo_file_id=message.photo[-1].file_id,
+            from_chat=False,
+        )
+        await message.answer(_PHOTO_ASK_TEXT, parse_mode="HTML")
+
+
+@router.message(PhotoState.waiting_for_prompt, F.text & ~F.text.startswith("/"))
+async def handle_photo_prompt(message: Message, bot: Bot, state: FSMContext):
+    """Foydalanuvchi rasm uchun prompt yuborganda."""
+    data = await state.get_data()
+    file_id = data.get("photo_file_id")
+    from_chat = data.get("from_chat", False)
+
+    if from_chat:
+        await state.set_state(ChatState.active)
+    else:
+        await state.clear()
+
+    await _handle_photo_by_file_id(message, bot, file_id, message.text.strip())
 
 
 # ══════════════════════════════════════════════════════════════
-#  MATN → TARJIMA
+#  MATN → GEMINI CHAT (default rejim)
 # ══════════════════════════════════════════════════════════════
 
-@router.message(F.text & ~F.text.startswith("/"))
-async def handle_text(message: Message, state: FSMContext):
-    """Oddiy matnni tarjima uchun qabul qilish."""
+@router.message(Command("translate"))
+async def cmd_translate(message: Message, state: FSMContext):
+    """Tarjima rejimini boshlash — foydalanuvchi matn yuboradi."""
+    await state.set_state(TranslateState.waiting_text)
+    await message.answer(
+        "🌐 <b>Tarjima rejimi</b>\n\n"
+        "Tarjima qilinishi kerak bo'lgan matnni yuboring:\n\n"
+        "Bekor qilish: /cancel",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("ocr"))
+async def cmd_ocr(message: Message, state: FSMContext):
+    await state.set_state(OCRState.waiting_image)
+    await message.answer(
+        "🖼 Matnni ko'chirmoqchi bo'lgan rasmni yuboring:\n"
+        "(Yoki istalgan rasmga caption qilib 'ocr' yozing)",
+        parse_mode="HTML",
+    )
+
+
+@router.message(OCRState.waiting_image, F.photo)
+async def handle_ocr_photo(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    photo = message.photo[-1]
+    await bot.send_chat_action(message.chat.id, "typing")
+    status = await message.reply("📝 <i>Matn aniqlanmoqda...</i>", parse_mode="HTML")
+
+    try:
+        file = await bot.get_file(photo.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, buf)
+        image_bytes = buf.getvalue()
+        result = await extract_text_from_image(image_bytes)
+        if len(result) > 4096:
+            result = result[:4040] + "\n\n⚠️ <i>Matn qisqartirildi</i>"
+        await status.edit_text(f"📝 <b>Rasmdagi matn:</b>\n\n{result}", parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"OCR handler xatolik (user={message.from_user.id}): {e}")
+        await status.edit_text(f"❌ <b>Xatolik:</b> <i>{str(e)[:200]}</i>", parse_mode="HTML")
+
+
+@router.message(Command("summarize"))
+async def cmd_summarize(message: Message, state: FSMContext):
+    await state.set_state(SummarizeState.waiting_text)
+    await message.answer("📝 Xulosa qilmoqchi bo'lgan matnni yuboring:")
+
+
+@router.message(SummarizeState.waiting_text, F.text)
+async def handle_summarize_text(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    await bot.send_chat_action(message.chat.id, "typing")
+
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        ui_lang = await get_ui_lang(db, message.from_user.id)
+
+    result = await summarize_text(message.text, target_lang=ui_lang)
+    await message.answer(f"📋 **Xulosa:**\n\n{result}", parse_mode="Markdown")
+
+
+@router.message(TranslateState.waiting_text, F.text & ~F.text.startswith("/"))
+async def handle_translate_input(message: Message, state: FSMContext):
+    """Tarjima uchun matn qabul qilish."""
     text = message.text.strip()
-
     if len(text) < 2:
         await message.answer("⚠️ Matn juda qisqa.")
         return
     if len(text) > 4000:
-        await message.answer(
-            f"⚠️ Matn juda uzun ({len(text)} belgi).\n"
-            f"Maksimal: 4000 belgi."
-        )
+        await message.answer(f"⚠️ Matn juda uzun ({len(text)} belgi). Maksimal: 4000 belgi.")
         return
 
     await state.update_data(pending_text=text)
@@ -547,11 +723,51 @@ async def handle_text(message: Message, state: FSMContext):
     await message.answer(
         f"📝 <b>Matn qabul qilindi</b> ({len(text)} belgi)\n\n"
         f"<i>{preview}</i>\n\n"
-        f"🌐 Qaysi tilga tarjima qilish kerak?\n"
-        f"<i>(AI Chat uchun — pastdagi tugma)</i>",
+        f"🌐 Qaysi tilga tarjima qilish kerak?",
         reply_markup=translate_keyboard(),
         parse_mode="HTML",
     )
+
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_text(message: Message, state: FSMContext):
+    """
+    Har qanday matn — Gemini Chat ga yuboriladi (default rejim).
+    Tarjima uchun /translate buyrug'idan foydalaning.
+    """
+    user_id = message.from_user.id
+    user_text = message.text.strip()
+
+    if len(user_text) < 2:
+        await message.answer("⚠️ Matn juda qisqa.")
+        return
+    if len(user_text) > 4000:
+        await message.answer(
+            f"⚠️ Matn juda uzun ({len(user_text)} belgi).\n"
+            f"Maksimal: 4000 belgi."
+        )
+        return
+
+    status = await message.reply("🤔 <i>Javob tayyorlanmoqda...</i>", parse_mode="HTML")
+
+    try:
+        history = await get_chat_history(user_id, limit=config.CHAT_HISTORY_LIMIT)
+        reply_text = await chat_with_gemini(history, user_text)
+
+        await add_chat_message(user_id, "user", user_text)
+        await add_chat_message(user_id, "model", reply_text)
+
+        if len(reply_text) > 4096:
+            reply_text = reply_text[:4040] + "\n\n⚠️ <i>Matn qisqartirildi</i>"
+
+        await status.edit_text(reply_text, parse_mode="HTML", reply_markup=chat_keyboard())
+
+    except Exception as e:
+        logger.error(f"Chat xatolik (user={user_id}): {e}")
+        await status.edit_text(
+            f"❌ <b>Xatolik:</b> <i>{str(e)[:200]}</i>\n\nQayta urinib ko'ring.",
+            parse_mode="HTML",
+        )
 
 
 @router.callback_query(F.data.startswith("translate:"))
@@ -578,6 +794,20 @@ async def cb_translate(callback: CallbackQuery, state: FSMContext):
         f"🎯 Maqsad: {flag}",
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data == "summarize")
+async def cb_summarize(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    text = data.get("last_stt_text", "")
+    if not text:
+        await callback.answer("Matn topilmadi.", show_alert=True)
+        return
+
+    await bot.send_chat_action(callback.message.chat.id, "typing")
+    result = await summarize_text(text)
+    await callback.message.answer(f"📋 **Xulosa:**\n\n{result}", parse_mode="Markdown")
+    await callback.answer()
 
     try:
         translated, detected = await translate_text(text, target)

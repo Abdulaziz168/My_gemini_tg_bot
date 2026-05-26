@@ -19,6 +19,7 @@ async def init_db():
                 username    TEXT,
                 full_name   TEXT,
                 lang_pref   TEXT DEFAULT 'auto',
+                ui_lang     TEXT DEFAULT 'uz',
                 joined_at   TEXT DEFAULT (datetime('now')),
                 last_seen   TEXT DEFAULT (datetime('now')),
                 is_banned   INTEGER DEFAULT 0
@@ -49,7 +50,13 @@ async def init_db():
                 created_at  TEXT DEFAULT (datetime('now')),
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             );
-        """)
+        """)        try:
+            await db.execute(
+                "ALTER TABLE users ADD COLUMN ui_lang TEXT DEFAULT 'uz'"
+            )
+        except aiosqlite.OperationalError:
+            # ustun allaqachon mavjud bo'lsa, davom etamiz
+            pass
         await db.commit()
     logger.info("✅ Database tayyor.")
 
@@ -102,6 +109,20 @@ async def get_all_user_ids() -> list[int]:
             rows = await cur.fetchall()
             return [r[0] for r in rows]
 
+async def set_ui_lang(db, user_id: int, lang: str):
+    await db.execute(
+        "UPDATE users SET ui_lang = ? WHERE user_id = ?",
+        (lang, user_id)
+    )
+    await db.commit()
+
+
+async def get_ui_lang(db, user_id: int) -> str:
+    async with db.execute(
+        "SELECT ui_lang FROM users WHERE user_id = ?", (user_id,)
+    ) as cur:
+        row = await cur.fetchone()
+        return row[0] if row else "uz"
 
 # ══════════════════════════════════════════════════════════════
 #  REQUESTS

@@ -40,6 +40,20 @@ class Config:
     # ── Database ────────────────────────────────────────────
     DB_PATH: str = "bot_database.db"
 
+    # Webhook (ixtiyoriy)
+    WEBHOOK_HOST: str = ""        # "https://yourdomain.com"
+    WEBHOOK_PATH: str = "/webhook"
+    WEBAPP_HOST: str = "0.0.0.0"
+    WEBAPP_PORT: int = 8443
+    @property
+    def WEBHOOK_URL(self) -> str:
+        return f"{self.WEBHOOK_HOST}{self.WEBHOOK_PATH}"
+    
+    @property
+    def USE_WEBHOOK(self) -> bool:
+        return bool(self.WEBHOOK_HOST)
+    
+
     def validate(self):
         if not self.BOT_TOKEN:
             raise ValueError("❌ TELEGRAM_BOT_TOKEN topilmadi!")
